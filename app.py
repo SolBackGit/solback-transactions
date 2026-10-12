@@ -85,7 +85,7 @@ async def home():
 
 @app.get('/health')
 async def health():
-    return {'build': 'SOLBACK-WEB-TEST-9', 'transaction_submission': recovery.configured(), 'service_fee_bps': FEE_BPS}
+    return {'build': 'SOLBACK-WEB-TELEGRAM-13', 'approval_mode': 'dual', 'transaction_submission': recovery.configured(), 'service_fee_bps': FEE_BPS}
 
 async def rpc(client, wallet, program):
     url = os.environ.get('SOLBACK_TEST_RPC_URL')
@@ -138,7 +138,13 @@ async def scan(body: Scan, request: Request):
             reason = account_reason(a['account'], info, program, wallet, amount)
             rows.append({'address':a['pubkey'],'mint':info['mint'],'program':program,'amount':amount['amount'],'decimals':amount['decimals'],'balance':amount['uiAmountString'],'rent_lamports':a['account']['lamports'],'kind':'empty' if int(amount['amount']) == 0 else 'balance','blocked_reason':reason})
     prune_jobs()
-    if len(JOBS)>=16: raise HTTPException(503,'Preparation capacity is busy. Please try later.')
+    if sum(
+        1 for job in JOBS.values()
+        if job.get('task') is not None and not job['task'].done()
+    ) >= 16:
+        raise HTTPException(503, 'Preparation capacity is busy. Please try later.')
+    if len(JOBS) >= 128:
+        raise HTTPException(503, 'Scan capacity is busy. Please try later.')
     token=secrets.token_urlsafe(32)
     JOBS[token]={'created':time.monotonic(),'wallet':wallet,'rows':rows,'balance':wallet_balance,'state':'scanned','progress':{},'eligible':{},'names':{},'task':None,'sol_usd':None}
     return {'scan_token':token,'wallet':wallet,'accounts':rows,'fee_bps':FEE_BPS,'elapsed_seconds':round(time.monotonic()-started,3),'rpc_requests':3,'wallet_balance_lamports':wallet_balance,'estimate':recovery_estimate(rows,wallet_balance),'prices_checked':False,'transaction_submission':False}
@@ -157,16 +163,42 @@ class Preparation(BaseModel):
 
 
 def prune_jobs():
+    # SOLBACK_PREPARATION_CAPACITY_V2
+    now = time.monotonic()
     for token, job in list(JOBS.items()):
-        if time.monotonic()-job['created']>3600 and (not job['task'] or job['task'].done()):
-            JOBS.pop(token,None)
+        task = job.get('task')
+        if task is not None and not task.done():
+            continue
+        last_used = job.get('last_used', job['created'])
+        if now - last_used > 3600:
+            JOBS.pop(token, None)
+
+    # Under memory pressure, remove only inactive sessions
+    # that have not been used for at least 15 minutes.
+    if len(JOBS) >= 128:
+        candidates = sorted(
+            (
+                (job.get('last_used', job['created']), token)
+                for token, job in JOBS.items()
+                if (job.get('task') is None or job['task'].done())
+                and now - job.get('last_used', job['created']) > 900
+            )
+        )
+        for _, token in candidates:
+            if len(JOBS) < 128:
+                break
+            JOBS.pop(token, None)
+
 
 
 def get_job(token):
     prune_jobs()
-    job=JOBS.get(token)
-    if not job: raise HTTPException(404,'Scan expired. Please scan the wallet again.')
+    job = JOBS.get(token)
+    if not job:
+        raise HTTPException(404, 'Scan expired. Please scan the wallet again.')
+    job['last_used'] = time.monotonic()
     return job
+
 
 async def read_rpc(client, method, params):
     if method not in ('getMultipleAccounts',): raise RuntimeError('Unsupported read method')
@@ -377,7 +409,7 @@ async def mark_wallet_sending(body:SendingPackets):
 @app.post('/api/recovery/refresh')
 async def refresh_recovery(body:ClaimToken):
     async with httpx.AsyncClient(timeout=25) as client:
-        return await recovery.refresh_blockhash(client,body.claim_token)
+        return await recovery.refresh_blockhash(client,body.claim_token,account_reason,checked_mint)
 
 @app.middleware('http')
 async def same_origin_mutations(request:Request,call_next):
@@ -392,3 +424,50 @@ async def same_origin_mutations(request:Request,call_next):
 @app.on_event('startup')
 async def recovery_startup():
     recovery.initialize()
+
+# OWNER_TEST_DISTRIBUTION
+from test_distribution import register as register_test_distribution
+register_test_distribution(app)
+
+# SOLBACK_WEB_DUAL_APPROVAL_V1
+class ApprovalMode(ClaimToken):
+    mode: str
+
+@app.post('/api/recovery/mode')
+async def change_recovery_mode(body:ApprovalMode):
+    await recovery.set_mode(body.claim_token,body.mode)
+    return await recovery.start_preparation(body.claim_token,account_reason,checked_mint)
+
+# SOLBACK_TELEGRAM_WEB_BRIDGE_V13
+from telegram_bridge import register as register_telegram_bridge
+TELEGRAM_BRIDGE = register_telegram_bridge(globals())
+
+# SOLBACK_PERSONAL_SCAN_ON_RESUME_V1
+@app.get('/api/recovery/preview/{token}')
+async def personal_recovery_preview(token:str):
+    import json
+    record=recovery.claim(token)
+    with recovery.database() as c:
+        packets=c.execute('SELECT state,payload FROM packets WHERE claim=?',(token,)).fetchall()
+        link=c.execute('SELECT scan_token FROM telegram_links WHERE claim_token=? LIMIT 1',(token,)).fetchone()
+    completed={r['address'] for p in packets if p['state']=='confirmed' for r in json.loads(p['payload'])['rows']}
+    rows=[r for r in json.loads(record['rows']) if r['address'] not in completed]
+    dust={}
+    for row in rows:
+        if row['kind']!='balance':continue
+        mint=row['mint'];quantity=Decimal(row['amount'])/(Decimal(10)**row['decimals'])
+        item=dust.setdefault(mint,{'mint':mint,'quantity':Decimal(0),'rent_lamports':0,'account_count':0,'unit_price_usd':row['checked_price'],'name':row.get('token_name',''),'symbol':row.get('token_symbol','')})
+        item['quantity']+=quantity;item['rent_lamports']+=row['rent_lamports'];item['account_count']+=1
+    for item in dust.values():
+        item['value_usd']=str(item['quantity']*Decimal(item['unit_price_usd']));item['quantity']=str(item['quantity'])
+    job=JOBS.get(link['scan_token'],{}) if link else {}
+    balance=job.get('balance',0)
+    estimate=recovery_estimate(rows,balance)
+    status=recovery.status(token)
+    known=status.get('estimated_total_net_lamports')
+    if known is not None:estimate['net_lamports']=max(0,known-status['net_recovered_lamports'])
+    return {'wallet':record['wallet'],'accounts':rows,'dust':list(dust.values()),'wallet_balance_lamports':balance,'estimate':estimate,'sol_usd':job.get('sol_usd')}
+
+# SOLBACK_DIRECT_WEB_CHECK_V1
+from web_check_notifications import register as register_web_check
+WEB_CHECK = register_web_check(globals())
