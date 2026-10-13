@@ -1,0 +1,8 @@
+{
+  "program_id": "38cMAQ5AJUiXvJd5ce6MjFGgS7wtEXoRWipGCnGnxmjV",
+  "library_name": "solback_compact_close",
+  "raw_binary_sha256": "ceb3bed443a117225769c14c50fc8dff9a55cbf9d2a388c4a5f757717bdf8030",
+  "cargo_build_sbf_version": "4.4.0",
+  "platform_tools_version": "v1.57",
+  "architecture": "v0"
+}

@@ -424,10 +424,8 @@ async def same_origin_mutations(request:Request,call_next):
 @app.on_event('startup')
 async def recovery_startup():
     recovery.initialize()
+    recovery.compact_tables.start_maintenance(recovery)
 
-# OWNER_TEST_DISTRIBUTION
-from test_distribution import register as register_test_distribution
-register_test_distribution(app)
 
 # SOLBACK_WEB_DUAL_APPROVAL_V1
 class ApprovalMode(ClaimToken):

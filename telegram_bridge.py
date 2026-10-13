@@ -162,7 +162,7 @@ def register(n):
                         outstanding=c.execute('SELECT state,payload FROM packets WHERE claim=? AND state IN ("confirmed","failed") AND id NOT IN (SELECT packet FROM telegram_receipt_acks)',(token,)).fetchall()
                         if not any(p['state']=='confirmed' or 'failed_user_network' in json.loads(p['payload']) for p in outstanding):
                             c.execute('UPDATE telegram_links SET sync_complete=1 WHERE session=?',(link['session'],))
-            except Exception as exc:logging.getLogger('solback.telegram-bridge').warning('Telegram ledger synchronization will retry: %s',type(exc).__name__)
+            except Exception as exc:logging.getLogger('solback.telegram-bridge').warning('Telegram ledger synchronization will retry: %s | status=%s | detail=%s',type(exc).__name__,getattr(exc,'status_code',''),getattr(exc,'detail',''))
 
     async def worker():
         while True:

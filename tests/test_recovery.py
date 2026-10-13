@@ -13,6 +13,13 @@ import app
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        # LEGACY_COMPACT_TEST_CONTEXT
+        from unittest.mock import patch
+        _cfg = dict(r.compact.config())
+        _cfg.update(enabled=False, public_all=False)
+        _legacy = patch.object(r.compact, 'config', return_value=_cfg)
+        _legacy.start()
+        self.addCleanup(_legacy.stop)
         self.proxies={k:v for k,v in os.environ.items() if k.lower().endswith('_proxy')}
         for key in self.proxies:os.environ.pop(key,None)
         self.t=tempfile.TemporaryDirectory();os.environ['SOLBACK_WEB_STATE']=self.t.name
@@ -32,7 +39,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             if method=='simulateTransaction':return {'value':{'err':self.sim_err}}
             if method=='sendTransaction':
                 tx=VersionedTransaction.from_bytes(base64.b64decode(params[0]));self.sent.append(params[0]);return str(tx.signatures[0])
-            if method=='getSignatureStatuses':return {'value':[{'confirmationStatus':'confirmed','err':None} if sig in self.chain else None for sig in params[0]]}
+            if method=='getSignatureStatuses':return {'value':[{'confirmationStatus':'finalized','err':None} if sig in self.chain else None for sig in params[0]]}
             if method=='getTransaction':return self.chain.get(params[0])
             if method=='getSignaturesForAddress':return [{'signature':s,'err':None,'blockTime':int(__import__('time').time())} for s in self.chain]
             if method=='getTokenAccountsByOwner':return {'value':[{'account':{'data':{'parsed':{'info':{'mint':str(self.mint),'tokenAmount':{'amount':'1','decimals':6}}}}}}]}
@@ -50,9 +57,22 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         tx=VersionedTransaction.from_bytes(base64.b64decode(p['transaction']));return self.owner_signed(tx)
     def owner_signed(self,tx):
         signatures=list(tx.signatures);index=list(tx.message.account_keys).index(self.owner.pubkey());signatures[index]=self.owner.sign_message(to_bytes_versioned(tx.message));return VersionedTransaction.populate(tx.message,signatures)
-    def confirm(self,tx):
-        keys=[str(k) for k in tx.message.account_keys];before=[1000000]*len(keys);after=before.copy();i=keys.index(str(self.owner.pubkey()));after[i]+=123456
-        self.chain[str(tx.signatures[0])]={'transaction':[r.encode(tx),'base64'],'meta':{'err':None,'fee':5000,'preBalances':before,'postBalances':after}}
+    def confirm(self, tx):
+        keys = [str(k) for k in tx.message.account_keys]
+        before = [1000000] * len(keys)
+        after = before.copy()
+        for row in self.rows:
+            if row['address'] in keys:
+                index = keys.index(row['address'])
+                before[index] = row['rent_lamports']
+                after[index] = 0
+        index = keys.index(str(self.owner.pubkey()))
+        after[index] += 123456
+        self.chain[str(tx.signatures[0])] = {
+            'transaction': [r.encode(tx), 'base64'],
+            'meta': {'err': None, 'fee': 5000,
+                     'preBalances': before, 'postBalances': after}
+        }
     async def test_empty_first_small_packets_and_twenty_percent(self):
         d=await r.prepare(None,self.token,app.account_reason,app.checked_mint)
         self.assertEqual([p['count'] for p in d['packets']],[10,1])
@@ -154,7 +174,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.block=Hash.new_unique();fresh=await r.refresh_blockhash(None,self.token)
         self.assertEqual(old,[p['id'] for p in fresh['packets']])
         self.assertTrue(all(str(VersionedTransaction.from_bytes(base64.b64decode(p['transaction'])).message.recent_blockhash)==str(self.block) for p in fresh['packets']))
-    async def test_owner_trial_gate_blocks_other_wallets(self):
+    async def test_legacy_trial_gate_when_public_compact_disabled(self):
         old=os.environ.get('SOLBACK_WEB_TEST_WALLETS')
         os.environ['SOLBACK_WEB_TEST_WALLETS']=str(Keypair().pubkey())
         try:

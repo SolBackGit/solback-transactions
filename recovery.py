@@ -21,6 +21,10 @@ from solders.instruction import Instruction, AccountMeta
 from solders.system_program import transfer, TransferParams
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
 
+import compact_support as compact
+import compact_tables
+from functools import partial
+
 GUARD='L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95'
 LOCK=asyncio.Lock()
 MAX_PACKETS=2048
@@ -72,18 +76,35 @@ def claim(token):
     record=dict(row)
     if record['state']=='superseded':raise HTTPException(409,'This unsigned preparation was replaced. Open your latest personal link.')
     allowed=set(os.environ.get('SOLBACK_WEB_TEST_WALLETS','').split())
-    if allowed and record['wallet'] not in allowed:raise HTTPException(403,'Recovery approval is currently restricted to the owner test wallets.')
+    public=compact.config().get('enabled') is True and compact.config().get('public_all') is True
+    existing_compact=isinstance(json.loads(record['selection']),dict) and json.loads(record['selection']).get('engine')==compact.ENGINE
+    if allowed and record['wallet'] not in allowed and not (public or existing_compact):raise HTTPException(403,'Recovery approval is currently restricted to the owner test wallets.')
     return record
 
 def shape(message):
-    keys=list(message.account_keys);h=message.header;n=h.num_required_signatures
-    if len(set(keys))!=len(keys):raise ValueError('Duplicate accounts')
-    rights={str(k):(i<n,i<n-h.num_readonly_signed_accounts if i<n else i<len(keys)-h.num_readonly_unsigned_accounts) for i,k in enumerate(keys)}
-    ops=[(str(keys[ix.program_id_index]),tuple(str(keys[i]) for i in ix.accounts),bytes(ix.data)) for ix in message.instructions]
-    return str(keys[0]),str(message.recent_blockhash),rights,ops
+    return compact.shape(message)
+
+def compact_unsigned(rows,wallet,block,service,sponsor=None,network=0,lookup_tables=None):
+    return compact.build(rows,wallet,block,service,sponsor,network,packet_instructions,lookup_tables)
+
+async def activate_compact(token):
+    async with LOCK:
+        record=claim(token)
+        if record['state']!='active' or not compact.eligible(record):return
+        with database() as c:
+            packets=c.execute('SELECT state,signature FROM packets WHERE claim=?',(token,)).fetchall()
+            if any(p['state'] in ('approved','signed','submitted','wallet_sending','review') for p in packets):return
+            selection=json.loads(record['selection'])
+            if selection.get('engine')==compact.ENGINE:return
+            # Replace only unsigned quotes, preserving every signed attempt.
+            if any(p['state']=='prepared' and p['signature'] for p in packets):return
+            c.execute('UPDATE packets SET state="expired" WHERE claim=? AND state="prepared" AND signature IS NULL',(token,))
+            selection.update(engine=compact.ENGINE,approval_mode='progressive')
+            c.execute('UPDATE claims SET selection=? WHERE token=?',(json.dumps(selection),token))
 
 def validate_message(received,expected):
-    if getattr(received,'address_table_lookups',[]):raise ValueError('Unexpected address lookup tables')
+    if list(getattr(received,'address_table_lookups',[]))!=list(getattr(expected,'address_table_lookups',[])):
+        raise ValueError('Address lookup tables changed')
     a=shape(expected);b=shape(received)
     if a[:2]!=b[:2]:raise ValueError('Fee payer or blockhash changed')
     if any(b[2].get(k)!=v for k,v in a[2].items()):raise ValueError('Account permissions changed')
@@ -124,7 +145,7 @@ def encode(tx):return base64.b64encode(bytes(tx)).decode()
 def create(job,selected):
     if job['state']!='ready':raise HTTPException(409,'Please wait for preparation to finish.')
     allowed=set(os.environ.get('SOLBACK_WEB_TEST_WALLETS','').split())
-    if allowed and job['wallet'] not in allowed:raise HTTPException(403,'Recovery approval is currently restricted to the owner test wallets.')
+    if allowed and job['wallet'] not in allowed and not (compact.config().get('enabled') is True and compact.config().get('public_all') is True):raise HTTPException(403,'Recovery approval is currently restricted to the owner test wallets.')
     if not configured():raise HTTPException(503,'Recovery configuration is incomplete.')
     if len(selected)!=len(set(selected)) or any(m not in job['eligible'] for m in selected):raise HTTPException(400,'Invalid Dust selection.')
     permitted={a for m in selected for a in job['eligible'][m]['addresses']}
@@ -138,6 +159,19 @@ def create(job,selected):
     token=secrets.token_urlsafe(32)
     with database() as c:
         previous=c.execute('SELECT token,selection FROM claims WHERE wallet=? AND state="active" ORDER BY created DESC LIMIT 1',(job['wallet'],)).fetchone()
+        # SOLBACK_COMPACT_DIRECT_HANDOFF_V1_1
+        if previous and (job['wallet']==compact.WALLET or compact.config().get('public_all') is True) and compact.config().get('enabled') is True and not job.get('telegram'):
+            prior_selection=json.loads(previous['selection'])
+            if isinstance(prior_selection,dict) and prior_selection.get('telegram_session'):
+                prior=previous['token']
+                prior_packets=c.execute('SELECT state,signature,signed FROM packets WHERE claim=?',(prior,)).fetchall()
+                if prior in BUILD_PROGRESS or any(p['state'] not in ('prepared','expired') or p['signature'] or p['signed'] for p in prior_packets):
+                    raise HTTPException(409,'The previous personal recovery has progress or signed transactions. Resume its original link.')
+                c.execute('UPDATE packets SET state="expired" WHERE claim=? AND state="prepared" AND signature IS NULL AND signed IS NULL',(prior,))
+                c.execute('UPDATE claims SET state="superseded" WHERE token=?',(prior,))
+                if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='telegram_links'").fetchone():
+                    c.execute('UPDATE telegram_links SET sync_complete=1 WHERE claim_token=?',(prior,))
+                previous=None
         if previous:
             previous_selection=json.loads(previous['selection'])
             previous_mints=previous_selection.get('mints',[]) if isinstance(previous_selection,dict) else previous_selection
@@ -245,7 +279,7 @@ async def reconcile(client,token):
             except (ValueError,KeyError,TypeError,IndexError):
                 with database() as c:c.execute('UPDATE packets SET state="review" WHERE id=?',(p['id'],))
                 continue
-            with database() as c:c.execute('UPDATE packets SET state="failed",payload=? WHERE id=?',(json.dumps(payload),p['id']))
+            with database() as c:c.execute('UPDATE packets SET state="failed",payload=?,signed=? WHERE id=?',(json.dumps(payload),encode(actual),p['id']))
             continue
         if status and status.get('confirmationStatus')=='finalized':
             # Verify the actual executed message, including wallet-added assertions.
@@ -257,14 +291,14 @@ async def reconcile(client,token):
                 validate_message(tx.message,original.message)
                 if not all(tx.verify_with_results()):raise ValueError()
                 if str(tx.signatures[0])!=p['signature'] or chain['meta']['err'] is not None:raise ValueError()
-                keys=[str(k) for k in tx.message.account_keys];i=keys.index(record['wallet'])
+                keys=list(map(str,compact.resolved_keys(tx.message,chain['meta'])[0]));i=keys.index(record['wallet'])
                 if any(chain['meta']['postBalances'][keys.index(row['address'])]!=0 for row in payload['rows']):raise ValueError()
                 net=chain['meta']['postBalances'][i]-chain['meta']['preBalances'][i]
                 payload['actual_net']=net;payload['actual_network']=chain['meta']['fee'];payload['actual_gross']=sum(chain['meta']['preBalances'][keys.index(row['address'])] for row in payload['rows'])
             except (ValueError,KeyError,TypeError):
                 with database() as c:c.execute('UPDATE packets SET state="review" WHERE id=?',(p['id'],))
                 continue
-            with database() as c:c.execute('UPDATE packets SET state="confirmed",payload=? WHERE id=?',(json.dumps(payload),p['id']))
+            with database() as c:c.execute('UPDATE packets SET state="confirmed",payload=?,signed=? WHERE id=?',(json.dumps(payload),encode(tx),p['id']))
             continue
         if height is None:height=await call(client,'getBlockHeight',[{'commitment':'confirmed'}])
         # A seen, non-final transaction is never rebuilt.
@@ -307,6 +341,7 @@ async def set_mode(token,mode):
     if mode not in ('grouped','progressive'):raise HTTPException(400,'Unknown approval mode.')
     async with LOCK:
         record=claim(token)
+        if compact.active(record) and mode!='progressive':raise HTTPException(409,'This recovery uses progressive compact approval.')
         if record['state']=='complete':raise HTTPException(409,'This recovery is already complete.')
         with database() as c:
             if c.execute('SELECT 1 FROM packets WHERE claim=? AND state IN ("approved","signed","submitted","wallet_sending","review")',(token,)).fetchone():
@@ -321,6 +356,7 @@ async def set_mode(token,mode):
         return status(token)
 
 async def prepare(client,token,account_reason,checked_mint):
+    await activate_compact(token)
     if approval_mode(claim(token))=='progressive':
         return await prepare_progressive(client,token,account_reason,checked_mint)
     return await prepare_grouped(client,token,account_reason,checked_mint)
@@ -443,6 +479,8 @@ async def prepare_progressive(client,token,account_reason,checked_mint):
     async with LOCK:
         BUILD_ERRORS.pop(token,None)
         record=claim(token)
+        is_compact=compact.active(record)
+        builder=compact_unsigned if is_compact else unsigned
         if approval_mode(record)!='progressive':return status(token)
         with database() as c:
             packets=c.execute('SELECT * FROM packets WHERE claim=? ORDER BY idx',(token,)).fetchall()
@@ -459,10 +497,11 @@ async def prepare_progressive(client,token,account_reason,checked_mint):
         completed={r['address'] for p in packets if p['state']=='confirmed' for r in json.loads(p['payload'])['rows']}
         remaining=[r for r in json.loads(record['rows']) if r['address'] not in completed]
         index=max([p['idx'] for p in packets],default=-1)+1
+        if is_compact:await compact.verify(client,call)
         while remaining:
             kind='empty' if any(r['kind']=='empty' for r in remaining) else 'balance'
             maximum=10 if kind=='empty' else 5
-            candidate=[r for r in remaining if r['kind']==kind][:maximum]
+            candidate=compact_tables.covered_rows(token,remaining) if is_compact else [r for r in remaining if r['kind']==kind][:maximum]
             BUILD_PROGRESS[token]={'phase':'Preparing the next transaction','done':0,'total':len(candidate)}
             good,excluded=await checked_rows(client,candidate,record['wallet'],account_reason,checked_mint)
             if excluded:
@@ -471,6 +510,10 @@ async def prepare_progressive(client,token,account_reason,checked_mint):
                 with database() as c:c.execute('UPDATE claims SET rows=? WHERE token=?',(record['rows'],token))
                 remaining=[r for r in remaining if r['address'] not in excluded]
             if not good:continue
+            lookup_tables=[]
+            if is_compact:
+                lookup_tables=[await compact_tables.ensure(client,call,token,good,sponsor_key(),BUILD_PROGRESS[token])]
+                builder=partial(compact_unsigned,lookup_tables=lookup_tables)
             # A sponsored first packet can fund the user's later network fees.
             # Decide sponsorship afresh for this packet, never lend SOL upfront.
             balance=(await call(client,'getBalance',[record['wallet'],{'commitment':'confirmed'}]))['value']
@@ -485,11 +528,14 @@ async def prepare_progressive(client,token,account_reason,checked_mint):
             batch=good
             while True:
                 gross=sum(r['rent_lamports'] for r in batch);service=gross*2000//10000
-                tx=unsigned(batch,record['wallet'],block['blockhash'],service,sponsor.pubkey() if sponsor else None,0)
+                tx=builder(batch,record['wallet'],block['blockhash'],service,sponsor.pubkey() if sponsor else None,1 if sponsor else 0)
+                if is_compact and not compact.fits(tx,batch):
+                    if len(batch)==1:raise HTTPException(409,'A selected account exceeds the supported packet size.')
+                    batch=batch[:-1];continue
                 fee=(await call(client,'getFeeForMessage',[base64.b64encode(to_bytes_versioned(tx.message)).decode(),{'commitment':'confirmed'}]))['value']
                 if fee is None:raise HTTPException(503,'Network quote unavailable. Try again.')
-                tx=unsigned(batch,record['wallet'],block['blockhash'],service,sponsor.pubkey() if sponsor else None,fee if sponsor else 0)
-                if len(bytes(tx))<=850:break
+                tx=builder(batch,record['wallet'],block['blockhash'],service,sponsor.pubkey() if sponsor else None,fee if sponsor else 0)
+                if (compact.fits(tx,batch) if is_compact else len(bytes(tx))<=850):break
                 if len(batch)==1:raise HTTPException(409,'A selected account exceeds the supported packet size.')
                 batch=batch[:max(1,len(batch)//2)]
             if gross<=service+fee:raise HTTPException(409,'This transaction has no positive recovery.')
@@ -497,11 +543,13 @@ async def prepare_progressive(client,token,account_reason,checked_mint):
                 raise HTTPException(503,'Gas sponsorship is temporarily busy. Your progress is saved.')
             # Validate exactly the final bytes, including the final blockhash.
             block=(await call(client,'getLatestBlockhash',[{'commitment':'confirmed'}]))['value']
-            tx=unsigned(batch,record['wallet'],block['blockhash'],service,sponsor.pubkey() if sponsor else None,fee if sponsor else 0)
+            tx=builder(batch,record['wallet'],block['blockhash'],service,sponsor.pubkey() if sponsor else None,fee if sponsor else 0)
             await simulate_final_transaction(client,tx)
             payload={'rows':batch,'gross':gross,'service':service,'network':fee,
                      'net':gross-service-fee,'sponsored':sponsored,'approval_mode':'progressive',
                      'transaction':encode(tx),'last_height':block['lastValidBlockHeight'],'prepared_at':time.time()}
+            if is_compact:
+                payload.update(engine=compact.ENGINE,wallet_send=True,lookup_table_addresses=[t['address'] for t in lookup_tables])
             with database() as c:
                 c.execute('INSERT INTO packets VALUES(?,?,?,?,?,?,?)',
                           (secrets.token_urlsafe(24),token,index,'prepared',json.dumps(payload),None,None))
@@ -542,6 +590,17 @@ async def refresh_progressive(client,token,account_reason=None,checked_mint=None
         if len(ready)!=1 or json.loads(ready[0]['payload']).get('approval_mode')!='progressive':
             raise HTTPException(409,'Resume recovery to prepare one transaction at a time.')
         p=ready[0];payload=json.loads(p['payload'])
+        is_compact=payload.get('engine')==compact.ENGINE
+        if is_compact!=compact.active(record):raise HTTPException(409,'Resume recovery for a fresh checked packet.')
+        if is_compact:await compact.verify(client,call)
+        original_for_tables=VersionedTransaction.from_bytes(base64.b64decode(payload['transaction']))
+        if is_compact:
+            try:await compact.verify_message_tables(client,call,original_for_tables.message)
+            except HTTPException as exc:
+                if exc.status_code==409:
+                    with database() as c:c.execute('UPDATE packets SET state="expired" WHERE id=? AND state="prepared"',(p['id'],))
+                raise
+        builder=partial(compact_unsigned,lookup_tables=compact.message_tables(original_for_tables.message)) if is_compact else unsigned
         if account_reason and checked_mint:
             good,excluded=await checked_rows(client,payload['rows'],record['wallet'],account_reason,checked_mint)
             if excluded or len(good)!=len(payload['rows']) or any(a['rent_lamports']!=b['rent_lamports'] for a,b in zip(good,payload['rows'])):
@@ -550,14 +609,20 @@ async def refresh_progressive(client,token,account_reason=None,checked_mint=None
         original=VersionedTransaction.from_bytes(base64.b64decode(payload['transaction']))
         sponsor=original.message.account_keys[0] if payload['sponsored'] else None
         block=(await call(client,'getLatestBlockhash',[{'commitment':'confirmed'}]))['value']
-        tx=unsigned(payload['rows'],record['wallet'],block['blockhash'],payload['service'],sponsor,payload['network'] if sponsor else 0)
+        tx=builder(payload['rows'],record['wallet'],block['blockhash'],payload['service'],sponsor,payload['network'] if sponsor else 0)
         try:
             await simulate_final_transaction(client,tx)
         except HTTPException as exc:
             if exc.status_code==409:
                 with database() as c:c.execute('UPDATE packets SET state="expired" WHERE id=? AND state="prepared"',(p['id'],))
             raise
+        if is_compact and payload['sponsored']:
+            key=sponsor_key()
+            if tx.message.account_keys[0]!=key.pubkey():raise HTTPException(503,'The fee sponsor changed. Resume to prepare a new checked transaction.')
+            signatures=list(tx.signatures);signatures[0]=key.sign_message(to_bytes_versioned(tx.message))
+            tx=VersionedTransaction.populate(tx.message,signatures)
         payload.update(transaction=encode(tx),last_height=block['lastValidBlockHeight'],prepared_at=time.time())
+        if is_compact:payload['wallet_send']=True
         with database() as c:c.execute('UPDATE packets SET payload=? WHERE id=? AND state="prepared"',(json.dumps(payload),p['id']))
         return status(token)
 
@@ -569,7 +634,7 @@ def status(token):
     prepared=[];confirmed=0;net=0;history=[];pending=False;review=False
     for row in rows:
         p=json.loads(row['payload'])
-        if row['state']=='prepared':prepared.append({'id':row['id'],**{k:p[k] for k in ('transaction','sponsored','net','network','service','gross','prepared_at')},'count':len(p['rows']),'kind':p['rows'][0]['kind'],'mints':list({r['mint'] for r in p['rows'] if r['kind']=='balance'})})
+        if row['state']=='prepared':prepared.append({'id':row['id'],**{k:p[k] for k in ('transaction','sponsored','net','network','service','gross','prepared_at')},'wallet_send':p.get('wallet_send',False),'count':len(p['rows']),'kind':'mixed' if p.get('engine')==compact.ENGINE else p['rows'][0]['kind'],'empty_count':sum(r['kind']=='empty' for r in p['rows']),'burn_count':sum(r['kind']=='balance' for r in p['rows']),'mints':list({r['mint'] for r in p['rows'] if r['kind']=='balance'})})
         if row['state']=='confirmed':confirmed+=len(p['rows']);net+=p.get('actual_net',p['net'])
         if row['state']=='failed':net-=p.get('failed_user_network',0)
         pending|=row['state'] in ('approved','signed','submitted','wallet_sending');review|=row['state']=='review'
@@ -592,7 +657,7 @@ def status(token):
     if confirmed==total and not pending and not review:
         record['state']='complete'
         with database() as c:c.execute('UPDATE claims SET state="complete" WHERE token=?',(token,))
-    return {'approval_mode':approval_mode(record),'estimated_total_net_lamports':estimated_total,'confirmed_transactions':sum(row['state']=='confirmed' for row in rows),'claim_token':token,'wallet':record['wallet'],'state':'review' if review else 'pending' if pending else 'building' if token in BUILD_PROGRESS else 'error' if token in BUILD_ERRORS else record['state'],'build_progress':BUILD_PROGRESS.get(token),'error':BUILD_ERRORS.get(token),'total_accounts':total,'excluded_accounts':max(0,original_count-total),'confirmed_accounts':confirmed,'net_recovered_lamports':net,'packets':prepared,'history':history,'percent':int(100*confirmed/total) if total else 100}
+    return {'engine':compact.ENGINE if compact.active(record) else None,'approval_mode':approval_mode(record),'estimated_total_net_lamports':estimated_total,'confirmed_transactions':sum(row['state']=='confirmed' for row in rows),'claim_token':token,'wallet':record['wallet'],'state':'review' if review else 'pending' if pending else 'building' if token in BUILD_PROGRESS else 'error' if token in BUILD_ERRORS else record['state'],'build_progress':BUILD_PROGRESS.get(token),'error':BUILD_ERRORS.get(token),'total_accounts':total,'excluded_accounts':max(0,original_count-total),'confirmed_accounts':confirmed,'net_recovered_lamports':net,'packets':prepared,'history':history,'percent':int(100*confirmed/total) if total else 100}
 
 async def submit(client,token,items,account_reason=None,checked_mint=None):
     async with LOCK:
@@ -611,8 +676,12 @@ async def submit(client,token,items,account_reason=None,checked_mint=None):
             if p['state'] not in ('prepared','wallet_sending'):continue
             payload=json.loads(p['payload'])
             if item.get('signature'):
-                if payload.get('approval_mode')=='progressive':raise HTTPException(400,'Sign the transaction without sending it; SolBack submits the checked bytes.')
-                if payload['sponsored']:raise HTTPException(400,'Sponsor signature must be collected after the wallet signature.')
+                if payload.get('approval_mode')=='progressive' and not (compact.active(record) and payload.get('engine')==compact.ENGINE):raise HTTPException(400,'Sign the transaction without sending it; SolBack submits the checked bytes.')
+                if payload['sponsored']:
+                    if p['state']!='wallet_sending' or not payload.get('wallet_send'):
+                        raise HTTPException(400,'The sponsored packet was not authorized for wallet submission.')
+                    original=VersionedTransaction.from_bytes(base64.b64decode(payload['transaction']))
+                    if item['signature']!=str(original.signatures[0]):raise HTTPException(400,'Sponsored transaction signature changed.')
                 try:Signature.from_string(item['signature'])
                 except ValueError:raise HTTPException(400,'Invalid transaction signature.')
                 validated.append((p,payload,None,item['signature']));continue
@@ -691,13 +760,24 @@ async def refresh(token):
 async def mark_sending(token,ids):
     async with LOCK:
         record=claim(token)
-        if approval_mode(record)!='grouped':raise HTTPException(409,'Use individual signing for this recovery.')
+        if approval_mode(record)!='grouped' and not compact.active(record):raise HTTPException(409,'Use individual signing for this recovery.')
+        if compact.active(record) and len(ids)!=1:raise HTTPException(400,'Submit one compact transaction at a time.')
         if not ids or len(ids)>MAX_PACKETS:raise HTTPException(400,'Invalid packet count.')
         with database() as c:
             for ident in ids:
                 p=c.execute('SELECT * FROM packets WHERE id=? AND claim=? AND state="prepared"',(ident,token)).fetchone()
-                if not p or json.loads(p['payload'])['sponsored']:raise HTTPException(400,'Packet is not eligible for wallet submission.')
-            for ident in ids:c.execute('UPDATE packets SET state="wallet_sending" WHERE id=?',(ident,))
+                if not p:raise HTTPException(400,'Packet is not eligible for wallet submission.')
+                payload=json.loads(p['payload'])
+                if payload['sponsored']:
+                    original=VersionedTransaction.from_bytes(base64.b64decode(payload['transaction']))
+                    if not payload.get('wallet_send') or not compact.active(record) or not original.signatures[0].verify(original.message.account_keys[0],to_bytes_versioned(original.message)):
+                        raise HTTPException(400,'The checked sponsor signature is not ready. Refresh recovery first.')
+                if compact.active(record) and json.loads(p['payload']).get('engine')!=compact.ENGINE:raise HTTPException(400,'Not a compact checked packet.')
+            for ident in ids:
+                p=c.execute('SELECT payload FROM packets WHERE id=? AND claim=?',(ident,token)).fetchone()
+                payload=json.loads(p['payload']);signature=None
+                if payload['sponsored']:signature=str(VersionedTransaction.from_bytes(base64.b64decode(payload['transaction'])).signatures[0])
+                c.execute('UPDATE packets SET state="wallet_sending",signature=? WHERE id=?',(signature,ident))
 
 RECONCILING={}
 

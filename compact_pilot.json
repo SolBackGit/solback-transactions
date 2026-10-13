@@ -1,0 +1,29 @@
+{
+  "enabled": true,
+  "wallet": "21Fsr1RTmM83GAjfydc8PJq4P2ycQHtaYgTvJswxSc2N",
+  "program": "38cMAQ5AJUiXvJd5ce6MjFGgS7wtEXoRWipGCnGnxmjV",
+  "current_table": "B22DVN6FJnXJZgDLGnAUcMbZwecjvkkXFnHA1akpPWaE",
+  "tables": [
+    {
+      "address": "B22DVN6FJnXJZgDLGnAUcMbZwecjvkkXFnHA1akpPWaE",
+      "authority": "BCHZpPJD26gajEZq63Rqvj2f1HkvSTZWSX3WpRbmrnP9",
+      "addresses": [
+        "54kGD1M6UTXjycQd5CHvPJ5Q5qKiZN6b4m2z1CHpc4Zb",
+        "8i5Uqm4WNF74PwZxH5M3Pcf86zd1vqDxQERWBUy7SH3B",
+        "J3K1LLqeDdx8GT8umLngApjtc7oARqFEcxCKBrmof5Eh",
+        "FBPKPkaJGV5RnhXssxp4ob3reZEeMgAbq7TNz35i3yWc",
+        "CbUPpa5zFuz2a4X35kBEjwYtgo6iooVwQZN7tfh2N9iQ",
+        "FdLS9QGj65W6yC9PMs2bsvA9Qw5sa1afxxS6RG9BVmwi",
+        "HnWgQBjvfecLhVqGjetcDmJGEhVrqEaADsV6PBLiJibc",
+        "2N8qruAsuSre8vEopvgEgBHigfnqBTFbmf9XTDw9pump",
+        "7Aa3Ypk1x48d2Se8ddTWr56HMdfhL1AzRRPK1DYspump",
+        "7siwAhDy42FAAbCGpwMNx2LWpwyTt7ekGz2Y5zmRaFAX",
+        "BABrNVTWCpsxR6L9bkwskefHrXo4Smu4Yv3qH6atpump",
+        "CniPCE4b3s8gSUPhUiyMjXnytrEqUrMfSsnbBjLCpump",
+        "GFWsh6yVZuk8qUV7eYTztiq6cVWKEfV8jnABo2EJpump"
+      ]
+    }
+  ],
+  "public_all": true,
+  "max_alt_locked_lamports": 200000000
+}
