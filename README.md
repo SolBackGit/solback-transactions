@@ -26,3 +26,7 @@ Checks use generated test keys, isolated temporary databases and mocked RPC. The
 ## Private configuration
 
 Private keys, environment files, live databases, runtime state and transaction ledgers are excluded. Dependencies are listed in requirements.txt.
+
+## Reproducible build layout
+
+The canonical Rust program is src/lib.rs, with Cargo.toml and Cargo.lock at the repository root. Deployment metadata remains in programs/compact-close/deployment.json.

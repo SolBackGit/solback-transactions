@@ -1,7 +1,12 @@
-[workspace]
-members = ["programs/compact-close"]
-resolver = "2"
-
+[package]
+name = "solback-compact-close"
+version = "0.1.0"
+edition = "2021"
+publish = false
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+solana-program = "=2.3.0"
 [profile.release]
 opt-level = 3
 lto = "fat"
