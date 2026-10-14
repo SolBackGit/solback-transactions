@@ -1,8 +1,9 @@
-"""Restricted compact pilot. No wallet keys, lending or ALT creation in HTTP routes."""
+"""Public compact recovery. Reuses the deployed program; no ALT creation."""
 import base64
 import hashlib
 import json
 import struct
+import compact_tables
 from pathlib import Path
 from fastapi import HTTPException
 from solders.address_lookup_table_account import AddressLookupTableAccount
@@ -35,21 +36,23 @@ def config():
 
 def eligible(record):
     selection=json.loads(record['selection'])
-    return (record['wallet']==WALLET and config().get('enabled') is True
-            and isinstance(selection,dict) and not selection.get('telegram_session'))
+    cfg=config()
+    return (cfg.get('enabled') is True and isinstance(selection,dict)
+            and (cfg.get('public_all') is True or
+                 (record['wallet']==WALLET and not selection.get('telegram_session'))))
 
 def active(record):
     selection=json.loads(record['selection'])
-    return record['wallet']==WALLET and isinstance(selection,dict) and selection.get('engine')==ENGINE
+    return isinstance(selection,dict) and selection.get('engine')==ENGINE
 
-def table_map():
+def table_map(names=None):
     return {t['address']:[Pubkey.from_string(k) for k in t['addresses']]
-            for t in config().get('tables',[])}
+            for t in [*config().get('tables',[]),*(compact_tables.named_tables(names) if names is not None else compact_tables.all_tables())]}
 
 def resolved_keys(message,meta=None):
     """Solana key ordering: static, all loaded writable, all loaded readonly."""
     lookups=getattr(message,'address_table_lookups',[])
-    writable=[];readonly=[];mapping=table_map() if lookups else {}
+    writable=[];readonly=[];mapping=table_map([str(x.account_key) for x in lookups]) if lookups else {}
     for lookup in lookups:
         address=str(lookup.account_key)
         if address not in mapping:raise ValueError('Unrecognized lookup table')
@@ -104,29 +107,22 @@ async def verify(client,call):
                 or raw[12]!=1 or str(Pubkey.from_bytes(raw[13:45]))!=AUTHORITY
                 or len(raw[45:])!=25984 or hashlib.sha256(raw[45:]).hexdigest()!=BINARY_HASH):
             raise ValueError()
-        table=next(t for t in cfg['tables'] if t['address']==cfg['current_table'])
-        response=await call(client,'getAccountInfo',[table['address'],{'encoding':'base64','commitment':'confirmed'}])
-        deactivation,last_slot,authority,addresses=decode_table(response['value'])
-        if (deactivation!=2**64-1 or authority!=table['authority'] or addresses!=table['addresses']):
-            raise ValueError()
-        if response['context']['slot']<=last_slot:
-            raise HTTPException(503,'Lookup table is warming up. Resume recovery shortly.')
     except (ValueError,KeyError,IndexError,TypeError,StopIteration):
         raise HTTPException(409,'Compact program or lookup table verification failed. No approval prepared.')
 
-def build(rows,wallet,block,service,sponsor,network,instructions_fn):
-    if wallet!=WALLET or sponsor or network:raise ValueError('Compact pilot requires one owner signer')
+def build(rows,wallet,block,service,sponsor,network,instructions_fn,lookup_tables=None):
     cfg=config()
     if not cfg.get('enabled'):raise ValueError('Compact pilot disabled')
-    table=next(t for t in cfg['tables'] if t['address']==cfg['current_table'])
-    covered=set(table['addresses'])
-    if any(r['address'] not in covered or (r['kind']=='balance' and r['mint'] not in covered) for r in rows):
-        raise HTTPException(409,'The test inventory changed. Update the test lookup table before continuing.')
+    wanted=set(compact_tables.required(rows))
+    if lookup_tables is None:
+        lookup_tables=[t for t in cfg.get('tables',[]) if wanted<=set(t['addresses'])][:1]
+    if not lookup_tables or not wanted<=set(k for t in lookup_tables for k in t['addresses']):
+        raise HTTPException(409,'A checked lookup table is required for compact recovery.')
     owner=Pubkey.from_string(wallet)
     # Reuse the production fee/referral allocation, with the same operations.
     import os
     treasury=Pubkey.from_string(os.environ['SOLBACK_WEB_TREASURY'])
-    source=instructions_fn(rows,wallet,treasury,service)[2:]
+    source=instructions_fn(rows,wallet,treasury,service,sponsor,network)[2:]
     token_programs=(Pubkey.from_string(TOKEN),Pubkey.from_string(TOKEN22))
     burns=[ix for ix in source if ix.program_id in token_programs and bytes(ix.data)[:1]==b'\x0f']
     fees=[ix for ix in source if ix.program_id not in token_programs]
@@ -136,12 +132,23 @@ def build(rows,wallet,block,service,sponsor,network,instructions_fn):
         *[AccountMeta(Pubkey.from_string(r['address']),False,True) for r in rows]])
     instructions=[set_compute_unit_limit(80000+5000*len(rows)+16000*len(burns)),
                   set_compute_unit_price(20000),*burns,close,*fees]
-    alt=AddressLookupTableAccount(Pubkey.from_string(table['address']),[Pubkey.from_string(k) for k in table['addresses']])
-    message=MessageV0.try_compile(owner,instructions,[alt],Hash.from_string(block))
-    return VersionedTransaction.populate(message,[Signature.default()])
+    alts=[AddressLookupTableAccount(Pubkey.from_string(t['address']),[Pubkey.from_string(k) for k in t['addresses']]) for t in lookup_tables]
+    message=MessageV0.try_compile(sponsor or owner,instructions,alts,Hash.from_string(block))
+    return VersionedTransaction.populate(message,[Signature.default()]*message.header.num_required_signatures)
 
 def fits(tx,rows):
     keys,_=resolved_keys(tx.message)
     return (1<=len(rows)<=56 and len(bytes(tx))<=850 and len(keys)<=63
             and len(tx.message.instructions)<=28 and len(tx.message.instructions)+len(rows)<=60
             and 80000+5000*len(rows)+16000*sum(r['kind']=='balance' for r in rows)<=1200000)
+
+
+def message_tables(message):
+    names=[str(x.account_key) for x in message.address_table_lookups]
+    stored={t['address']:t for t in [*config().get('tables',[]),*compact_tables.named_tables(names)]}
+    try:return [stored[str(lookup.account_key)] for lookup in message.address_table_lookups]
+    except KeyError:raise HTTPException(409,'The checked lookup-table record is unavailable.')
+
+async def verify_message_tables(client,call,message):
+    for table in message_tables(message):
+        await compact_tables.verify_table(client,call,table)

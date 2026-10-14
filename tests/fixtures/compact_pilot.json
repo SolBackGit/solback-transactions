@@ -23,5 +23,7 @@
         "GFWsh6yVZuk8qUV7eYTztiq6cVWKEfV8jnABo2EJpump"
       ]
     }
-  ]
+  ],
+  "public_all": true,
+  "max_alt_locked_lamports": 200000000
 }

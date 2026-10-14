@@ -66,16 +66,18 @@ def all_tables():
 def required(rows):
     return list(dict.fromkeys([r['address'] for r in rows]+[r['mint'] for r in rows if r['kind']=='balance']))
 
-def ready_table(rows,token=None):
+def ready_table(rows,token=None,wallet=None):
     wanted=set(required(rows))
     for table in all_tables():
-        if table['state']=='ready' and (token is None or table['claim_token']==token) and wanted<=set(table['addresses']):
+        if table['state']=='ready' and (token is None or table['claim_token']==token or (wallet and table['wallet']==wallet)) and wanted<=set(table['addresses']):
             return table
     return None
 
 def covered_rows(token,rows):
+    import recovery
+    wallet=recovery.claim(token)['wallet']
     for table in all_tables():
-        if table['claim_token']!=token or table['state']!='ready':continue
+        if (table['claim_token']!=token and table['wallet']!=wallet) or table['state']!='ready':continue
         covered=set(table['addresses'])
         group=[r for r in rows if r['address'] in covered and (r['kind']!='balance' or r['mint'] in covered)]
         if group:return group[:56]
@@ -174,7 +176,9 @@ async def ensure(client,call,token,rows,sponsor,progress):
         if wanted<=set(table['addresses']):
             await verify_table(client,call,table);return table
     async with LEASE_LOCK:
-        table=ready_table(rows,token)
+        import recovery
+        wallet=recovery.claim(token)['wallet']
+        table=ready_table(rows,token,wallet)
         if table:
             await verify_table(client,call,table);return table
         addresses=required(rows)
@@ -253,18 +257,21 @@ async def maintain_once(client,recovery):
         processed=0
         for table in tables:
             with recovery.database() as db:
-                claim=db.execute('SELECT state,rows FROM claims WHERE token=?',(table['claim_token'],)).fetchone()
-                packets=db.execute('SELECT state,payload FROM packets WHERE claim=?',(table['claim_token'],)).fetchall()
+                claims=db.execute('SELECT token,state,rows FROM claims WHERE wallet=?',(table['wallet'],)).fetchall()
+                packets=db.execute('SELECT p.claim,p.state,p.payload FROM packets p JOIN claims q ON q.token=p.claim WHERE q.wallet=?',(table['wallet'],)).fetchall()
             relevant=[p for p in packets if table['address'] in json.loads(p['payload']).get('lookup_table_addresses',[])]
             if any(p['state'] in ('approved','signed','submitted','wallet_sending','review') for p in relevant):continue
-            completed={r['address'] for p in packets if p['state']=='confirmed' for r in json.loads(p['payload'])['rows']}
-            remaining={r['address'] for r in json.loads(claim['rows'])}-completed if claim and claim['state']=='active' else set()
+            remaining=set()
+            for claim in claims:
+                if claim['state']!='active':continue
+                completed={r['address'] for p in packets if p['claim']==claim['token'] and p['state']=='confirmed' for r in json.loads(p['payload'])['rows']}
+                remaining.update({r['address'] for r in json.loads(claim['rows'])}-completed)
             expired=time.time()-table['touched']>86400
             if remaining & set(table['rows']) and not expired:continue
             if any(p['state']=='prepared' for p in relevant):
                 if not expired:continue
                 with recovery.database() as db:
-                    for p in db.execute('SELECT id,payload FROM packets WHERE claim=? AND state="prepared"',(table['claim_token'],)).fetchall():
+                    for p in db.execute('SELECT p.id,p.payload FROM packets p JOIN claims q ON q.token=p.claim WHERE q.wallet=? AND p.state="prepared"',(table['wallet'],)).fetchall():
                         if table['address'] in json.loads(p['payload']).get('lookup_table_addresses',[]):
                             db.execute('UPDATE packets SET state="expired" WHERE id=?',(p['id'],))
             if processed>=4:break

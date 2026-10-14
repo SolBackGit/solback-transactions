@@ -51,31 +51,6 @@ def register(n):
                 r.schedule_reconcile(link['claim_token']);result=r.status(link['claim_token'])
                 with r.database() as c:c.execute('UPDATE telegram_links SET last_activity=? WHERE session=?',(time.time(),meta['session']))
                 return {'recovery':result,'link_expires_at':meta['expires']}
-            # Reopening a newer Telegram scan must resume the same user's existing personal recovery.
-            with r.database() as c:
-                previous=c.execute('SELECT l.* FROM telegram_links l JOIN claims q ON q.token=l.claim_token WHERE l.wallet=? AND q.state="active" ORDER BY q.created DESC',(meta['wallet'],)).fetchall()
-            for saved in previous:
-                previous_meta=json.loads(saved['metadata'])
-                if previous_meta.get('user_id')==meta['user_id']:
-                    await bot_call('/internal/telegram-web/bind',{'session':saved['session'],'claim_token':saved['claim_token']})
-                    with r.database() as c:c.execute('UPDATE telegram_links SET last_activity=? WHERE session=?',(time.time(),saved['session']))
-                    r.schedule_reconcile(saved['claim_token'])
-                    return {'recovery':r.status(saved['claim_token']),'link_expires_at':meta['expires']}
-            # SOLBACK_PERSONAL_RECONCILE_BEFORE_SCAN_V1
-            with r.database() as c:
-                anonymous=c.execute('SELECT token,selection FROM claims WHERE wallet=? AND state="active" ORDER BY created DESC LIMIT 1',(meta['wallet'],)).fetchone()
-            if anonymous:
-                prior_selection=json.loads(anonymous['selection'])
-                if not isinstance(prior_selection,dict) or not prior_selection.get('telegram_session'):
-                    prior_token=anonymous['token']
-                    async def check_previous():
-                        async with r.LOCK,httpx.AsyncClient(timeout=25) as client:
-                            await r.reconcile(client,prior_token)
-                    try:
-                        await asyncio.wait_for(check_previous(),timeout=35)
-                    except Exception:
-                        logging.getLogger('solback.bridge').exception('Earlier recovery reconciliation deferred')
-                        r.schedule_reconcile(prior_token)
             if meta.get('claim_token'):raise HTTPException(409,'The recovery ledger is unavailable. Do not start another claim.')
             if link and link['scan_token'] in jobs:
                 job=jobs[link['scan_token']];job['telegram']=meta
@@ -99,23 +74,12 @@ def register(n):
         meta=job.get('telegram')
         if not meta:return original_create(job,selected)
         if meta['expires']<time.time():raise HTTPException(401,'This personal recovery has expired. Scan again in Telegram.')
+        # The same personal link is idempotent; a different link creates a new recovery.
         with r.database() as c:
-            existing=c.execute('SELECT selection FROM claims WHERE wallet=? AND state="active" ORDER BY created DESC LIMIT 1',(job['wallet'],)).fetchone()
-            if existing:
-                selection=json.loads(existing['selection'])
-                if not isinstance(selection,dict) or selection.get('telegram_session')!=meta['session']:
-                    previous=c.execute('SELECT token FROM claims WHERE wallet=? AND state="active" ORDER BY created DESC LIMIT 1',(job['wallet'],)).fetchone()
-                    prior=previous['token']
-                    if isinstance(selection,dict) and selection.get('telegram_session'):
-                        raise HTTPException(409,'An earlier personal recovery exists. Reopen your Telegram link to resume it.')
-                    packets=c.execute('SELECT state,signature,signed FROM packets WHERE claim=?',(prior,)).fetchall()
-                    if prior in r.BUILD_PROGRESS or any(p['state'] not in ('prepared','expired','failed','confirmed') or (p['state'] in ('prepared','expired') and (p['signature'] or p['signed'])) for p in packets):
-                        r.schedule_reconcile(prior)
-                        raise HTTPException(409,'The earlier approval is being checked. If it already has signed transactions, resume its original link; confirmed progress is preserved.')
-                    # SOLBACK_SAFE_UNSIGNED_HANDOFF_V1
-                    # Retire only a settled or unsigned anonymous plan; keep every confirmed receipt.
-                    c.execute('UPDATE packets SET state="expired" WHERE claim=? AND state="prepared" AND signature IS NULL',(prior,))
-                    c.execute('UPDATE claims SET state="superseded" WHERE token=?',(prior,))
+            bound=c.execute('SELECT claim_token FROM telegram_links WHERE session=?',(meta['session'],)).fetchone()
+        if bound and bound['claim_token']:
+            r.claim(bound['claim_token'])
+            return bound['claim_token']
         claim=original_create(job,selected)
         with r.database() as c:
             record=c.execute('SELECT rows,selection FROM claims WHERE token=?',(claim,)).fetchone()

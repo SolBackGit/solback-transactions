@@ -764,6 +764,7 @@ function showClaim(d){
     $('resume-recovery').textContent=d.state==='pending'?'Waiting for confirmation…':d.state==='building'?'Preparing next transaction…':'Resume recovery →';
     $('claim-title').textContent=d.state==='complete'?'Recovery complete':d.state==='building'?(grouped?'Preparing all recovery transactions':'Preparing transaction '+step):d.state==='error'?'Preparation interrupted':d.state==='pending'?(grouped?'Waiting for network confirmation':'Transaction '+step+' is confirming'):d.state==='review'?'Transaction requires review':(!choiceValid?'Choose how to approve':grouped?'Ready for grouped approval':'Ready for transaction '+step);
     $('claim-detail').textContent=d.state==='complete'?'Your recovery is complete. The confirmed SOL is back in your wallet.':d.state==='building'?(grouped?'Checking all selected transactions. Your confirmed progress is saved.':'Checking the next group of accounts. Your confirmed progress is saved.'):d.state==='error'?(d.error||'Resume to retry preparation.'):d.state==='pending'?'Waiting for final network confirmation. No further approval is needed while this transaction is pending.':d.state==='review'?'An unexpected transaction result needs checking. Further recovery is paused.':(d.confirmed_accounts?'The previous transaction is confirmed. ':'')+(!choiceValid?'Select an approval method to continue.':grouped?'Review and approve your recovery transactions together.':'Approve the next transaction to continue. You can pause and resume; confirmed progress is saved.');
+    if(d.waiting_for_previous&&d.state==='pending')$('claim-detail').textContent='Checking an earlier wallet approval. Your new recovery will continue after its result is known; you do not need to reopen the old link.';
     const q=$('claim-quote');
     q.hidden=!ready;
     q.replaceChildren();
@@ -900,7 +901,7 @@ $('approve-recovery').onclick=async()=>{
         $('claim-detail').textContent=grouped?'Review the checked transactions in your wallet. Your progress updates as they confirm.':'Review this transaction in your wallet. After approval, wait for confirmation before the next step.';
         let submission;
         // SOLBACK_COMPACT_PHANTOM_SEND_V1_2
-        if(d.engine==='compact-pilot-1'){
+        if(d.engine==='compact-pilot-1'&&!packets[0].sponsored){
             if(packets.length!==1)throw Error('Expected one checked compact transaction.');
             if(packets[0].sponsored&&!packets[0].wallet_send)throw Error('Refresh recovery to obtain the checked fee sponsorship.');
             if(typeof walletProvider.signAndSendTransaction!=='function')throw Error('Open this recovery in Phantom or a wallet that supports signing and sending transactions.');
@@ -927,6 +928,7 @@ $('approve-recovery').onclick=async()=>{
             signed=await walletApprovalRequest(()=>walletProvider.signAllTransactions(txs));
         }else{
             if(typeof walletProvider.signTransaction!=='function')throw Error('Use a wallet that supports individual transaction signing.');
+            if(d.engine==='compact-pilot-1'&&packets[0].sponsored)txs[0].signatures[0]=new Uint8Array(64);
             signed=[await walletApprovalRequest(()=>walletProvider.signTransaction(txs[0]))];
         }
         requireWallet(d.wallet);
